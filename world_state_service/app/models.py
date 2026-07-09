@@ -192,13 +192,63 @@ class WorldFlagsUpdate(BaseModel):
 
 # ── Encounter ──────────────────────────────────────────────────────────────
 
+class CombatCapabilities(BaseModel):
+    attacks_per_action: int = Field(default=1, ge=1)
+    can_attack_as_bonus_action: bool = False
+    can_dash_as_bonus_action: bool = False
+    can_disengage_as_bonus_action: bool = False
+    can_dodge_as_bonus_action: bool = False
+    can_help_as_bonus_action: bool = False
+    can_hide_as_bonus_action: bool = False
+    can_ready_as_bonus_action: bool = False
+    can_opportunity_attack: bool = True
+
+class CombatTurnState(BaseModel):
+    movement_spent: int = Field(default=0, ge=0)
+    extra_movement_budget: int = Field(default=0, ge=0)
+    action_available: bool = True
+    bonus_action_available: bool = True
+    reaction_available: bool = True
+    attacks_used_this_action: int = Field(default=0, ge=0)
+    disengage_active: bool = False
+    dodge_active: bool = False
+    hidden: bool = False
+    help_target_id: Optional[UUID] = None
+    help_type: Optional[str] = None
+    ready_trigger: Optional[str] = None
+    ready_action: Optional[str] = None
+
+
+class DamageDefenses(BaseModel):
+    damage_resistances: list[str] = Field(default_factory=list)
+    damage_immunities: list[str] = Field(default_factory=list)
+    damage_vulnerabilities: list[str] = Field(default_factory=list)
+
 class CombatantState(BaseModel):
     combatant_id: UUID
     name: str
     is_player: bool
     current_hp: int
     max_hp: int
+    temp_hp: int = Field(default=0, ge=0)
+    armor_class: int = 10
+    speed: int = 30
+    ability_scores: AbilityScores = Field(default_factory=AbilityScores)
+    proficiency_bonus: int = 2
     conditions: list[str] = Field(default_factory=list)
+    proficient_skills: list[str] = Field(default_factory=list)
+    proficient_saving_throws: list[str] = Field(default_factory=list)
+    expertise_skills: list[str] = Field(default_factory=list)
+    exhaustion_level: int = Field(default=0, ge=0, le=6)
+    is_proficient_with_weapon: bool = True
+    concentration: Optional[str] = None
+    spell_slots: SpellSlots = Field(default_factory=SpellSlots)
+    death_saves: DeathSaves = Field(default_factory=DeathSaves)
+    damage_resistances: list[str] = Field(default_factory=list)
+    damage_immunities: list[str] = Field(default_factory=list)
+    damage_vulnerabilities: list[str] = Field(default_factory=list)
+    combat_capabilities: CombatCapabilities = Field(default_factory=CombatCapabilities)
+    turn_state: CombatTurnState = Field(default_factory=CombatTurnState)
     position: Optional[Position] = None
 
 
