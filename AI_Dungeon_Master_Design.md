@@ -191,7 +191,81 @@ implementing rules.
 
 ### Rules Engine
 
-Implements D&D 5e SRD mechanics.
+Implements D&D 5e SRD deterministic mechanics. All rule evaluation is stateless — the service receives the current state as input and returns a deterministic result. No database writes; all persistence is handled by the calling service.
+
+**Mechanics implemented:**
+
+-   **Dice** — Full d20 notation (`3d6kh2+4`, advantage, disadvantage) via the avrae `d20` library.
+-   **Ability checks and saving throws** — DC comparison, proficiency bonus, advantage/disadvantage.
+-   **Attack rolls** — finesse weapons (higher of STR/DEX modifier), ranged-in-melee disadvantage, cover bonus (+2 half / +5 three-quarters), damage resistance/immunity/vulnerability.
+-   **Conditions** — All 15 PHB conditions plus exhaustion levels 1–6.
+-   **Concentration** — CON save DC = max(10, damage ÷ 2).
+-   **Grapple / shove** — Contested Athletics vs Athletics/Acrobatics; ties go to the defender.
+-   **Movement validation** — speed budget, difficult terrain, prone movement penalty.
+-   **Spell validation** — slot level, range, and concentration conflict check.
+-   **Initiative** — DEX modifier + d20.
+-   **Death saves** — three successes (stabilise) or three failures (dead).
+
+**API routes:**
+
+All routes accept an optional `event_context` field; when supplied, the Rules Engine emits an audit event to the Event Log Service.
+
+**`EventContext`** (optional on every request):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `str` | |
+| `session_id` | `str` | |
+| `user_id` | `str` | JWT `sub` claim of acting player |
+| `aggregate_id` | `str` | ID of the primary entity (character, NPC) |
+| `aggregate_type` | `str` | `character` / `npc` / `combat` / `story` / `world` (default `character`) |
+
+**`CombatantStats`** (passed on all combat routes):
+
+| Field | Type | Default |
+|-------|------|---------|
+| `id` | `str` | required |
+| `name` | `str` | required |
+| `ability_scores` | `{strength … charisma: int}` | all 10 |
+| `proficiency_bonus` | `int` | 2 |
+| `armor_class` | `int` | 10 |
+| `max_hp` / `current_hp` | `int` | 10 |
+| `speed` | `int` | 30 |
+| `conditions` | `list[Condition]` | [] |
+| `proficient_skills` | `list[Skill]` | [] |
+| `proficient_saving_throws` | `list[AbilityScore]` | [] |
+| `expertise_skills` | `list[Skill]` | [] |
+| `exhaustion_level` | `int` 0–6 | 0 |
+| `is_proficient_with_weapon` | `bool` | true (caller asserts) |
+
+**`WeaponDefinition`**:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | `str` | |
+| `damage_dice` | `str` | e.g. `"1d8"`, `"2d6"` |
+| `damage_type` | `DamageType` | one of 13 PHB types |
+| `ability_score` | `AbilityScore` | default `strength` |
+| `finesse` | `bool` | rolls with higher of STR/DEX modifier |
+| `ranged` | `bool` | triggers disadvantage if adjacent to hostile creature |
+| `magical` | `bool` | bypasses non-magical resistance |
+| `attack_bonus` / `damage_bonus` | `int` | magic weapon bonuses |
+
+**Route request / response detail:**
+
+| Route | Key request fields | Key response fields |
+|-------|-------------------|---------------------|
+| `POST /roll` | `notation: str`, `purpose?` | `total: int`, `dice_values: list[int]`, `expression: str` |
+| `POST /ability-check` | `combatant: CombatantStats`, `ability: AbilityScore`, `dc: int`, `skill?: Skill`, `advantage_state?` | `total: int`, `dc: int`, `success: bool`, `proficiency_applied: int` |
+| `POST /saving-throw` | `combatant`, `ability`, `dc`, `advantage_state?` | `total, dc, success` |
+| `POST /attack` | `attacker: CombatantStats`, `weapon: WeaponDefinition`, `target_ac: int`, `target_defenses?`, `cover_bonus: 0/2/5`, `adjacent_to_hostile_creature?`, `extra_damage_dice?: list[str]` | `hit, critical_hit, damage_total, damage_modifier: none/resistance/immunity/vulnerability, effective_ac` |
+| `POST /initiative` | `combatants: list[CombatantStats]` | `order: list[{combatant_id, total, dexterity_modifier}]` sorted high→low |
+| `POST /death-save` | `combatant_id`, `current_successes`, `current_failures` | `success, critical_stabilize, critical_failure, new_successes, new_failures, stabilized, dead` |
+| `POST /movement/validate` | `combatant`, `distance: int`, `difficult_terrain: bool`, `is_prone: bool` | `valid, cost, remaining_speed` |
+| `POST /spell/validate` | `caster`, `spell_name`, `spell_level`, `available_slots: SpellSlots`, `is_concentration`, `concentration_active?` | `valid, rejection_reason?, breaks_concentration, slot_consumed?` |
+| `POST /concentration-check` | `caster`, `damage_taken: int` | `dc: int`, `roll, total, success` — DC = max(10, damage ÷ 2) |
+| `POST /grapple` | `attacker: CombatantStats`, `target: CombatantStats`, `defender_uses_acrobatics?` | `grapple_succeeds`, `contest: {attacker_total, defender_total, attacker_wins}` |
+| `POST /shove` | `attacker`, `target`, `shove_type: knock_prone/push_away` | `shove_succeeds`, `contest: ContestResult` |
 
 ### Combat Engine
 
@@ -199,82 +273,539 @@ Handles initiative, attacks, damage, conditions, and movement.
 
 ### Story State Manager
 
-Tracks plot, quests, unresolved hooks, and campaign progression.
+Tracks narrative progression — quests with objectives, plot hooks, and a structured story log. All data is per-campaign. The DM Service is the primary writer; player clients never call this service directly.
+
+**Database schema:**
+
+```sql
+CREATE TABLE quests (
+    quest_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id        UUID NOT NULL,
+    title              TEXT NOT NULL,
+    description        TEXT,
+    status             TEXT NOT NULL DEFAULT 'active'
+                           CHECK (status IN ('hidden','active','completed','failed')),
+    giver_npc_id       UUID,
+    reward_description TEXT,
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at       TIMESTAMPTZ,   -- auto-set by PATCH when status → completed/failed
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Index: (campaign_id, status)
+
+CREATE TABLE quest_objectives (
+    objective_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    quest_id       UUID NOT NULL REFERENCES quests ON DELETE CASCADE,
+    campaign_id    UUID NOT NULL,     -- denormalized for efficient campaign queries
+    description    TEXT NOT NULL,
+    sequence_order INT NOT NULL DEFAULT 0,
+    completed_at   TIMESTAMPTZ        -- NULL = incomplete
+);
+-- Index: (campaign_id, quest_id)
+
+CREATE TABLE plot_hooks (
+    hook_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id     UUID NOT NULL,
+    content         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open','resolved','dismissed')),
+    priority        TEXT NOT NULL DEFAULT 'medium'
+                        CHECK (priority IN ('low','medium','high','critical')),
+    source_event_id UUID,             -- optional link to the event that created the hook
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at     TIMESTAMPTZ       -- auto-set when status → resolved/dismissed
+);
+-- Index: (campaign_id, status, priority)
+
+CREATE TABLE story_log (
+    entry_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL,
+    session_id  UUID,
+    entry_type  TEXT NOT NULL CHECK (entry_type IN (
+                    'narration','combat_summary','quest_update','hook_note','session_summary')),
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Index: (campaign_id, session_id, created_at)
+```
+
+**Key design decisions:**
+
+-   **Hidden quests** — `status=hidden` rows are excluded from all player-visible routes. Only DM-privileged routes (`/dm/quests`) return them, enabling pre-creation before player discovery.
+-   **Acts deferred** — hierarchical act/scene structure is not implemented in v1.
+-   **N+1 avoided on list routes** — objectives for a quest list are fetched in a single `WHERE quest_id = ANY($1::uuid[])` query and grouped in Python.
+-   **DM context endpoint** — `GET /context` returns active quests + open hooks + recent log in one call, eliminating three round trips on the DM Service hot path.
+-   **COALESCE PATCH** — `completed_at` is auto-set (`now()`) when status transitions to `completed` or `failed`. `resolved_at` is auto-set on hooks.
+
+**Key request models:**
+
+`POST /quests` body — `QuestCreate`:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `campaign_id` | `UUID` | required |
+| `title` | `str` | required |
+| `description` | `str?` | — |
+| `status` | `QuestStatus` | `active` |
+| `giver_npc_id` | `UUID?` | — |
+| `reward_description` | `str?` | — |
+| `objectives` | `list[{description, sequence_order}]` | [] — created inline |
+| `meta` | `EventMeta?` | — |
+
+`POST /story-log` body — `StoryLogBatch`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `entries` | `list[StoryLogEntry]` | minimum 1 required |
+| `meta` | `EventMeta?` | |
+
+Each `StoryLogEntry`: `{ campaign_id, session_id?, entry_type, content }`.
+
+`GET /context` query params: `campaign_id` (required), `session_id?`, `log_limit=20` (max 100).
+
+`GET /context` response — `DMContext`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `UUID` | |
+| `active_quests` | `list[QuestOut]` | status=active, with objectives attached |
+| `open_hooks` | `list[HookOut]` | status=open, sorted critical→high→medium→low |
+| `recent_log` | `list[StoryLogOut]` | Most recent `log_limit` entries, returned in chronological order |
+
+**API routes:**
+
+| Method | Path | Query params | Notes |
+|--------|------|-------------|-------|
+| `POST` | `/quests` | — | `QuestCreate` body; 201 returns `QuestOut` with objectives |
+| `GET` | `/quests` | `campaign_id`, `status?` | Excludes hidden; `QuestOut` includes objectives |
+| `GET` | `/quests/{id}` | `campaign_id` | 404 if hidden |
+| `PATCH` | `/quests/{id}` | `campaign_id` | `QuestUpdate` body; emits status-change event |
+| `DELETE` | `/quests/{id}` | `campaign_id` | Hard delete; 204 |
+| `POST` | `/quests/{id}/objectives` | `campaign_id` | Add objective to existing quest; 201 |
+| `PATCH` | `/quests/{id}/objectives/{obj_id}` | `campaign_id` | `{completed: bool}`; emits `story.objective_completed` |
+| `DELETE` | `/quests/{id}/objectives/{obj_id}` | `campaign_id` | 204 |
+| `GET` | `/dm/quests` | `campaign_id`, `status?` | All quests including hidden |
+| `GET` | `/dm/quests/{id}` | `campaign_id` | Any quest including hidden |
+| `POST` | `/hooks` | — | `HookCreate` body; 201 |
+| `GET` | `/hooks` | `campaign_id`, `status?`, `priority?` | Sorted by priority |
+| `GET` | `/hooks/{id}` | `campaign_id` | |
+| `PATCH` | `/hooks/{id}` | `campaign_id` | `HookUpdate` body; emits `story.hook_resolved` when status changes |
+| `DELETE` | `/hooks/{id}` | `campaign_id` | 204 |
+| `POST` | `/story-log` | — | `StoryLogBatch` body (min 1 entry); returns `list[StoryLogOut]`; 201 |
+| `GET` | `/story-log` | `campaign_id`, `session_id?`, `entry_type?`, `limit=50` (max 500) | Ordered DESC (newest first) |
+| `GET` | `/context` | `campaign_id`, `session_id?`, `log_limit=20` | `DMContext` snapshot |
+| `GET` | `/health` | — | DB connectivity check |
+
+**Events emitted:**
+
+| Event | Trigger |
+|-------|---------|
+| `story.quest_started` | Quest created as active, or status transitions to active |
+| `story.quest_completed` | Status → completed |
+| `story.quest_failed` | Status → failed |
+| `story.objective_completed` | Objective `completed_at` set |
+| `story.hook_created` | Hook created |
+| `story.hook_resolved` | Hook status → resolved or dismissed |
+| `story.session_summary_created` | Story log batch contains a `session_summary` entry |
 
 ### Memory Service
 
-Uses pgvector to retrieve long-term memories and relationships.
+Provides long-term semantic campaign memory using pgvector. Consumes the unified `events:all` Redis Stream asynchronously — services never call it directly to write memories. The DM Service and NPC Service call it to recall memories for prompt context.
+
+**Database schema:**
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE memories (
+    memory_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id      UUID NOT NULL,
+    subject_type     TEXT NOT NULL,      -- 'campaign'|'character'|'npc'|'world'
+    subject_id       UUID NOT NULL,      -- entity the memory is about
+    content          TEXT NOT NULL,      -- 1–2000 chars
+    embedding        vector(384),        -- BAAI/bge-small-en-v1.5, generated server-side
+    importance       INT  NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+    source_event_ids UUID[] NOT NULL DEFAULT '{}',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- B-tree: (campaign_id), (campaign_id, subject_type, subject_id)
+-- HNSW:   USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64)
+```
+
+**`POST /memories` body — `MemoryIn`:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `UUID` | |
+| `subject_type` | `SubjectType` | `campaign` / `character` / `npc` / `world` |
+| `subject_id` | `UUID` | Entity the memory is about |
+| `content` | `str` | 1–2000 chars; embedding generated automatically |
+| `importance` | `int` 1–5 | default 3; higher = ranked above equally-distant memories |
+| `source_event_ids` | `list[UUID]` | Event IDs that produced this memory |
+
+**`GET /memories/recall` query params:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `campaign_id` | `UUID` | required | |
+| `query` | `str` | required | Text embedded and compared against stored embeddings |
+| `subject_type` | `str?` | — | Filter to one subject type |
+| `subject_id` | `UUID?` | — | Filter to one subject |
+| `limit` | `int` | 5 (max 20) | |
+
+**Recall SQL** (importance-weighted):
+```sql
+ORDER BY (embedding <=> query_embedding) / importance
+LIMIT $limit
+```
+Higher `importance` divides the cosine distance, making important memories rank above merely-similar ones.
+
+**`PATCH /memories/{id}` body — `MemoryUpdate`:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `importance` | `int?` 1–5 | |
+| `content` | `str?` | Re-embeds automatically when content changes |
+
+**Event handlers — auto-create memories from the stream:**
+
+| Event consumed | Memory created |
+|---------------|----------------|
+| `npc.disposition_changed` | NPC attitude shift toward a character |
+| `story.hook_created` | New narrative thread |
+| `story.hook_resolved` | Hook resolution summary |
+| `dm.narration_generated` | Significant DM narration passages |
+| `session.started` / `session.ended` | Session bookmarks |
+| `combat.state_changed` | Combat deaths and significant outcomes |
+| `world.state_changed` | Notable world changes |
+
+**API routes:**
+
+| Method | Path | Query params / body | Response |
+|--------|------|---------------------|----------|
+| `POST` | `/memories` | `MemoryIn` body | `201 { memory_id: str }` |
+| `GET` | `/memories/recall` | `campaign_id`, `query`, `subject_type?`, `subject_id?`, `limit=5` | `{ memories: list[MemoryOut], query, top_k }` |
+| `GET` | `/memories` | `campaign_id`, `subject_id?`, `subject_type?` | `list[MemoryOut]` |
+| `GET` | `/memories/{id}` | `campaign_id` (query param) | `MemoryOut` |
+| `PATCH` | `/memories/{id}` | `MemoryUpdate` body + `campaign_id` query param | `MemoryOut` |
+| `DELETE` | `/memories/{id}` | `campaign_id` query param | `204` |
+| `GET` | `/health` | — | `{ status, checks: { database, redis } }` |
+
+**Stream consumer:** `XREADGROUP` + `XAUTOCLAIM` from `events:all`. Consumer group: `memory-service`. Requires Redis 7.0+.
 
 ### NPC Interaction Service
 
-Roleplays any NPC in the campaign. Each NPC has a persistent identity
-that survives across sessions — personality, secrets, and per-character
-relationships all influence how the NPC speaks and what they reveal.
+Provides NPC identity persistence, prompt assembly, and dialogue history management. This service builds the LLM context; the DM Service calls the LLM. NPCs have a persistent identity that survives across sessions.
 
-**NPC identity model (stored in PostgreSQL):**
+**Database schema:**
 
--   **Profile** — `npc_id`, `campaign_id`, name, role (e.g., innkeeper,
-    villain, quest giver), physical description, and a freetext
-    `personality_prompt` that is injected verbatim into the LLM system
-    prompt (e.g., *"Gruff, distrustful of magic users, secretly grieving
-    a lost daughter"*).
--   **Secrets** — a list of `{ secret_id, content, reveal_condition }`
-    rows. The service only injects a secret into the prompt when its
-    `reveal_condition` is met (e.g., disposition score ≥ 70, or a
-    specific quest flag is set). Secrets are never sent to the client
-    directly.
--   **Disposition scores** — a `(npc_id, character_id, score int)`
-    table tracking each NPC's attitude toward each player character.
-    Score ranges: 0–30 hostile, 31–60 neutral, 61–80 friendly,
-    81–100 trusted. Scores are updated by the DM Service after each
-    interaction based on player choices.
--   **Faction memberships** — optional link to a faction record in
-    World State; disposition toward the faction rolls up to the NPC.
+```sql
+CREATE TABLE npc_profiles (
+    npc_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id          UUID NOT NULL,
+    name                 TEXT NOT NULL,
+    role                 TEXT NOT NULL,         -- freetext: innkeeper, villain, quest_giver, etc.
+    physical_description TEXT,
+    personality_prompt   TEXT NOT NULL CHECK (char_length(personality_prompt) <= 2000),
+    is_active            BOOLEAN NOT NULL DEFAULT true,   -- soft-delete flag
+    faction_id           UUID,                  -- optional link to World State faction_standing
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Index: (campaign_id, is_active)
+-- Migration: ALTER TABLE npc_profiles ADD COLUMN IF NOT EXISTS faction_id UUID
 
-**Per-conversation state:**
+CREATE TABLE npc_secrets (
+    secret_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    npc_id                 UUID NOT NULL REFERENCES npc_profiles ON DELETE CASCADE,
+    campaign_id            UUID NOT NULL,        -- denormalized
+    content                TEXT NOT NULL,
+    condition_type         TEXT NOT NULL CHECK (condition_type IN
+                               ('always','disposition_gte','quest_status')),
+    condition_value        INT,                  -- threshold for disposition_gte
+    condition_quest_title  TEXT,                 -- quest title for quest_status
+    condition_quest_status TEXT,                 -- expected quest status for quest_status
+    revealed_at            TIMESTAMPTZ           -- set on first injection; immutable thereafter
+);
+-- Index: (campaign_id, npc_id)
+```
 
--   Short-term dialogue context (last N turns) is held in **Redis**
-    for the duration of the session.
--   Long-term memory (summarised past interactions) is retrieved from
-    **pgvector** via the Memory Service at conversation start.
--   After the conversation ends, the DM Service writes a summary back
-    to the Memory Service and persists any disposition score changes.
+**Redis dialogue history:**
 
-**Prompt assembly order:**
+```
+Key:    npc:dialogue:{campaign_id}:{npc_id}:{session_id}
+Type:   Redis List — each element is JSON: {role: "player"|"npc", content: str, ts: ISO8601}
+TTL:    24 hours (refreshed on every append)
+Trim:   LTRIM to last 20 turns (40 messages) after each append
+```
 
-1.  NPC system persona (`personality_prompt`)
-2.  Applicable secrets (filtered by reveal condition)
-3.  Long-term memory summary from pgvector
-4.  Current disposition level toward the active character
-5.  Recent dialogue history from Redis
-6.  Player's latest message
+**Structured reveal conditions** (evaluated at prompt-assembly time):
+
+| `condition_type` | Parameters | Satisfied when |
+|-----------------|------------|----------------|
+| `always` | — | Always injected |
+| `disposition_gte` | `condition_value: int` | Character's disposition score ≥ threshold |
+| `quest_status` | `condition_quest_title: str`, `condition_quest_status: str` | Named quest is at the specified status |
+
+**Disposition and faction roll-up:**
+
+-   Disposition scores live in **World State Service** (`npc_disposition` table), not here. Ranges: 0–30 hostile, 31–60 neutral, 61–80 friendly, 81–100 trusted.
+-   If no character-specific score exists, the NPC's **faction standing** (from `GET {world_state}/factions/{faction_id}`) is used as a fallback baseline.
+-   Disposition `notes` (freetext reason from World State) are injected into the assembled prompt.
+
+**`POST /npcs/{id}/context` request — `NPCContextRequest`:**
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `campaign_id` | `UUID` | required | |
+| `session_id` | `UUID` | required | |
+| `character_id` | `UUID` | required | Whose disposition to read |
+| `player_message` | `str` | required | Used as memory recall semantic query |
+| `dialogue_history_limit` | `int` | 20 (max 100) | Turns to load from Redis |
+| `memory_limit` | `int` | 5 (max 20) | Memories to recall from pgvector |
+
+**`POST /npcs/{id}/context` response — `NPCContextResponse`:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `npc_id` | `UUID` | |
+| `npc_name` | `str` | |
+| `system_prompt` | `str` | **Fully assembled** — DM Service passes this directly to the LLM |
+| `dialogue_history` | `list[{role, content, ts}]` | From Redis — append to LLM message list |
+| `disposition_score` | `int?` | Character-specific score, or faction standing fallback |
+| `disposition_label` | `str` | `hostile` / `neutral` / `friendly` / `trusted` / `unknown` |
+| `disposition_notes` | `str?` | Freetext reason from World State; injected into system prompt |
+| `faction_standing` | `int?` | Faction score used as fallback (returned for DM transparency) |
+| `secrets_injected_count` | `int` | |
+| `secrets_injected` | `list[SecretSummary]` | Full content — for DM transparency **only**; never forward to player |
+| `memory_context` | `str?` | Joined memory recall text, already injected into `system_prompt` |
+
+`SecretSummary` fields: `{ secret_id, content, condition_type, first_revealed: bool }`. `first_revealed=true` means this call is the first time this secret's condition was ever satisfied.
+
+**External calls during context assembly** (all fail-gracefully):
+
+| Call | Purpose | Fallback |
+|------|---------|---------|
+| `GET {world_state}/npcs/{npc_id}/dispositions?campaign_id=` | Character-specific score + notes | `(None, None)` |
+| `GET {world_state}/factions/{faction_id}?campaign_id=` | Faction standing fallback | `None` |
+| `GET {story_state}/quests?campaign_id=` | `{title: status}` map for quest_status conditions | `{}` |
+| `GET {memory_service}/memories/recall?campaign_id=&subject_id=&query=` | Past interaction summary | `None` |
+
+**API routes:**
+
+| Method | Path | Query params | Notes |
+|--------|------|-------------|-------|
+| `POST` | `/npcs` | — | `NPCCreate` body; 201 |
+| `GET` | `/npcs` | `campaign_id`, `active_only=true` | |
+| `GET` | `/npcs/{id}` | `campaign_id` | No secrets in response |
+| `PATCH` | `/npcs/{id}` | `campaign_id` | `clear_physical_description: true` to NULL the field |
+| `DELETE` | `/npcs/{id}` | `campaign_id` | Soft-delete (`is_active=false`); 404 if already inactive |
+| `POST` | `/npcs/{id}/secrets` | `campaign_id` | DM-privileged; 201 |
+| `GET` | `/npcs/{id}/secrets` | `campaign_id` | DM-privileged; returns reveal conditions |
+| `PATCH` | `/npcs/{id}/secrets/{secret_id}` | `campaign_id` | Update condition or content |
+| `DELETE` | `/npcs/{id}/secrets/{secret_id}` | `campaign_id` | Hard delete; 204 |
+| `POST` | `/npcs/{id}/context` | — | **Hot path**; `NPCContextRequest` body; assembles full prompt |
+| `GET` | `/npcs/{id}/dialogue` | `campaign_id`, `session_id`, `limit=20` | Reads Redis directly; no external calls |
+| `POST` | `/npcs/{id}/dialogue` | — | `DialogueAppend` body; appends turn to Redis; 201 |
+| `DELETE` | `/npcs/{id}/dialogue` | `campaign_id`, `session_id` | Clears Redis key; 204 |
+| `GET` | `/health` | — | Checks DB + Redis |
+
+**Events emitted:**
+
+| Event | Trigger |
+|-------|---------|
+| `npc.created` | Profile created |
+| `npc.updated` | Profile patched |
+| `npc.secret_revealed` | Secret injected for the first time (`revealed_at` was NULL) |
 
 ### World State Service
 
-Maintains canonical state of the world.
+Maintains the authoritative, mutable runtime state of the game across five domains. Every domain is campaign-scoped. State is persisted directly in PostgreSQL; reads are not cached to guarantee freshness.
+
+**Database schema:**
+
+```sql
+-- One row per (character_id, campaign_id) — composite PK
+CREATE TABLE character_state (
+    character_id UUID, campaign_id UUID, user_id UUID,
+    name TEXT, class_name TEXT DEFAULT '',
+    level INT DEFAULT 1, xp INT DEFAULT 0,
+    current_hp INT, max_hp INT DEFAULT 1, temp_hp INT DEFAULT 0,
+    armor_class INT DEFAULT 10, speed INT DEFAULT 30,
+    ability_scores JSONB,             -- {strength, dexterity, constitution, intelligence, wisdom, charisma}
+    conditions TEXT[], exhaustion_level INT DEFAULT 0,
+    spell_slots JSONB,                -- {level_1 … level_9}
+    concentration TEXT,               -- active spell name, or NULL
+    death_saves JSONB,                -- {successes: 0–3, failures: 0–3}
+    position JSONB,                   -- {x, y, map_id} or NULL
+    inventory JSONB, currency JSONB,  -- {cp, sp, ep, gp, pp}
+    active_effects JSONB,             -- list[{name, duration_rounds?, source}]
+    proficiency_bonus INT DEFAULT 2,
+    proficient_skills TEXT[], proficient_saving_throws TEXT[], expertise_skills TEXT[],
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (character_id, campaign_id)
+);
+
+CREATE TABLE npc_disposition (
+    npc_id UUID, campaign_id UUID, character_id UUID,
+    score INT DEFAULT 50 CHECK (score BETWEEN 0 AND 100),
+    notes TEXT DEFAULT '',            -- freetext reason for current score
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (npc_id, campaign_id, character_id)
+);
+
+CREATE TABLE world_flags (
+    campaign_id UUID, key TEXT, value JSONB,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (campaign_id, key)
+);
+
+CREATE TABLE encounter_state (
+    encounter_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL UNIQUE,   -- one active encounter per campaign
+    map_id UUID,
+    round INT DEFAULT 1, current_turn_index INT DEFAULT 0,
+    initiative_order JSONB,             -- list[{combatant_id, name, total, is_player}]
+    combatant_states JSONB,             -- {str(combatant_id): {combatant_id, name, is_player, current_hp, max_hp, conditions, position}}
+    active BOOL DEFAULT TRUE,
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE faction_standing (
+    campaign_id UUID, faction_id TEXT,
+    standing INT DEFAULT 0 CHECK (standing BETWEEN -100 AND 100),
+    notes TEXT DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (campaign_id, faction_id)
+);
+```
+
+**Key design decisions:**
+
+-   **Atomic character PATCH** — uses `SELECT FOR UPDATE` inside an explicit transaction to serialise concurrent HP changes. Supports `expected_updated_at` for explicit optimistic concurrency; returns 409 on mismatch.
+-   **Encounter combatant merge** — `combatant_states` is JSONB; partial updates use `combatant_states || $patch::jsonb` (merge operator, not replace). Returns 409 if `updated_at` has changed.
+-   **World flags** — single JSONB column per campaign; PATCH merges keys rather than replacing the whole document.
+
+**Key request models:**
+
+`PATCH /characters/{id}` body — `CharacterUpdate` (all fields optional):
+
+```
+current_hp?, max_hp?, temp_hp?, armor_class?, speed?,
+conditions?, exhaustion_level?, spell_slots?, concentration?,
+death_saves?, position?, inventory?, currency?, active_effects?,
+xp?, level?, ability_scores?, proficiency_bonus?,
+proficient_skills?, proficient_saving_throws?, expertise_skills?,
+expected_updated_at?   ← optimistic concurrency; 409 if row changed
+event_meta?: { session_id, user_id }
+```
+
+`PUT /encounter` / `POST-equivalent` body — `EncounterCreate`:
+```
+campaign_id, map_id?,
+initiative_order: list[{combatant_id, name, total, is_player}],
+combatant_states: {str(combatant_id): CombatantState},
+event_meta?
+```
+
+`PATCH /encounter` body — `EncounterUpdate`:
+```
+round?, current_turn_index?,
+combatant_states?  ← merged into existing JSONB column (|| operator)
+expected_updated_at  ← REQUIRED; 409 if row was updated since last read
+event_meta?
+```
+
+`PATCH /world/flags` body — `WorldFlagsUpdate`:
+```
+flags: { "key": value, … }   ← keys are merged/upserted; existing unmentioned keys preserved
+event_meta?
+```
+
+`PATCH /npcs/{npc_id}/dispositions` body — `DispositionUpdate`:
+```
+character_id: UUID,
+score: int 0–100,
+reason: str,   ← stored in notes field; emitted in event payload
+event_meta?
+```
+
+**API routes (18 total):**
+
+| Method | Path | Query params | Notes |
+|--------|------|-------------|-------|
+| `POST` | `/characters` | — | Creates; body is `CharacterCreate` |
+| `GET` | `/characters` | `campaign_id` | Returns `list[CharacterState]` |
+| `GET` | `/characters/{id}` | `campaign_id` | Returns `CharacterState` |
+| `PUT` | `/characters/{id}` | — | Full replace; body is `CharacterCreate`; 201 |
+| `PATCH` | `/characters/{id}` | `campaign_id` | Atomic update; 409 on concurrency conflict |
+| `DELETE` | `/characters/{id}` | `campaign_id` | Hard delete; 204 |
+| `GET` | `/npcs/{npc_id}/dispositions` | `campaign_id` | Returns `{npc_id, campaign_id, dispositions: list[DispositionRecord]}` |
+| `PATCH` | `/npcs/{npc_id}/dispositions` | — | Upsert score; emits `npc.disposition_changed` |
+| `GET` | `/world/flags` | `campaign_id` | Returns `{campaign_id, flags: dict}` |
+| `GET` | `/world/flags/{key}` | `campaign_id` | Returns `{campaign_id, key, value}` — 404 if absent |
+| `PATCH` | `/world/flags` | — | Merge-update; body is `WorldFlagsUpdate` |
+| `DELETE` | `/world/flags/{key}` | `campaign_id` | Deletes one flag; 204 |
+| `GET` | `/encounter` | `campaign_id` | Returns full `EncounterState` |
+| `PUT` | `/encounter` | — | Create or replace; body is `EncounterCreate` |
+| `PATCH` | `/encounter` | — | Partial update with combatant merge; 409 on version conflict |
+| `DELETE` | `/encounter` | `campaign_id` | Ends encounter; 204 |
+| `GET` | `/factions/{id}` | `campaign_id` | Returns `FactionStandingRecord` |
+| `PATCH` | `/factions/{id}` | `campaign_id` | Upsert standing score |
 
 ### Event Log Service
 
-Provides an **append-only audit trail** of every significant game event
-across all services. No service modifies or deletes event rows.
-The log serves two purposes: **debugging LLM decisions** (why did the
-DM say that?) and **campaign replay** (reconstruct world state at any
-point in time).
+Provides an **append-only audit trail** of every significant game event across all services. No service modifies or deletes event rows. The log serves two purposes: **debugging LLM decisions** (why did the DM say that?) and **campaign replay** (reconstruct world state at any point in time).
 
-**Event record schema:**
+**Database schema:**
 
-  Field              Type        Description
-  ------------------ ----------- --------------------------------------------------
-  `event_id`         UUID        Globally unique, generated by the emitting service
-  `campaign_id`      UUID        Campaign this event belongs to
-  `session_id`       UUID        Play session within the campaign
-  `user_id`          UUID        Acting player (`sub` claim from JWT)
-  `event_type`       enum        See event taxonomy below
-  `aggregate_id`     UUID        ID of the affected entity (character, NPC, etc.)
-  `aggregate_type`   string      `character`, `npc`, `combat`, `story`, `world`
-  `payload`          JSONB       Full event data (rule inputs, dice rolls, outcomes)
-  `llm_prompt_hash`  text        SHA-256 of the prompt sent to the LLM (nullable)
-  `occurred_at`      timestamptz Emitting service wall time
+```sql
+CREATE TABLE events (
+    event_id        UUID PRIMARY KEY,          -- generated by emitting service
+    campaign_id     UUID NOT NULL,
+    session_id      UUID NOT NULL,
+    user_id         UUID NOT NULL,             -- JWT sub claim
+    event_type      TEXT NOT NULL,
+    aggregate_id    UUID NOT NULL,
+    aggregate_type  TEXT NOT NULL,             -- 'character'|'npc'|'combat'|'story'|'world'
+    payload         JSONB NOT NULL DEFAULT '{}',
+    source_service  TEXT NOT NULL,
+    llm_prompt_hash TEXT,                      -- SHA-256 of LLM prompt; only DM Service sets this
+    occurred_at     TIMESTAMPTZ NOT NULL
+);
+-- Indexes: (campaign_id, session_id, occurred_at DESC)
+--          (campaign_id, aggregate_id, occurred_at DESC)
+```
+
+**`POST /events` body — `EventIn`:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `event_id` | `UUID` | Generated by the emitting service (idempotent: duplicate silently ignored) |
+| `campaign_id` | `UUID` | |
+| `session_id` | `UUID` | |
+| `user_id` | `UUID` | JWT `sub` claim |
+| `event_type` | `str` | See taxonomy below |
+| `aggregate_id` | `UUID` | ID of the affected entity |
+| `aggregate_type` | `str` | `character` / `npc` / `combat` / `story` / `world` |
+| `payload` | `dict` | Full event data — rule inputs, dice rolls, outcomes |
+| `source_service` | `str` | Which microservice emitted the event |
+| `llm_prompt_hash` | `str?` | SHA-256 of LLM prompt; only set by DM Service |
+| `occurred_at` | `datetime` | Wall time of the emitting service |
+
+**API routes:**
+
+| Method | Path | Query params | Response |
+|--------|------|-------------|----------|
+| `POST` | `/events` | — | `201 { event_id: str }` |
+| `GET` | `/events` | `campaign_id` (required), `session_id?`, `aggregate_id?`, `aggregate_type?`, `event_type?`, `limit=100` | `list[EventOut]` ordered by `occurred_at DESC` |
+| `GET` | `/health` | — | `{ status, checks: { database, redis } }` |
+
+**Redis publishing** — every written event is simultaneously published to:
+-   `events:campaign:{campaign_id}` — per-campaign stream, consumed by session-level listeners.
+-   `events:all` — unified cross-campaign stream, consumed by the Memory Service (`XREADGROUP`, consumer group `memory-service`).
 
 **Event taxonomy:**
 
@@ -283,22 +814,23 @@ point in time).
 -   `attack.resolved` — attacker, target, to-hit roll, damage, hit/miss
 -   `spell.cast` — spell name, slot used, targets, rule validation result
 -   `combat.state_changed` — initiative order, HP delta, condition applied/removed
--   `story.hook_created` / `story.hook_resolved` — quest/plot changes
+-   `story.quest_started` / `story.quest_completed` / `story.quest_failed` — quest lifecycle
+-   `story.objective_completed` — individual objective checked off
+-   `story.hook_created` / `story.hook_resolved` — plot hook lifecycle
+-   `story.session_summary_created` — session summary appended to story log
+-   `npc.created` / `npc.updated` — NPC profile changes
 -   `npc.disposition_changed` — old score, new score, reason
+-   `npc.secret_revealed` — first time a secret condition is satisfied
 -   `world.state_changed` — which world-state key changed and to what value
 -   `dm.narration_generated` — prompt hash, model used, token count
 -   `session.started` / `session.ended`
 
 **Design rules:**
 
--   Events are written **synchronously** before the service returns its
-    response — a failed write is a failed request.
--   Services publish events to a **Redis Stream** (`events:campaign:{id}`)
-    in addition to writing to PostgreSQL; the Memory Service consumes
-    the stream to update pgvector summaries asynchronously.
--   The Event Log Service exposes a read API used by the DM Service
-    to retrieve the last N events for a session (used for prompt
-    context) and by an admin endpoint for campaign replay.
+-   Events are written **synchronously** before the service returns its response — a failed write is a failed request.
+-   `ON CONFLICT (event_id) DO NOTHING` — duplicate events from retries are silently dropped.
+-   Services call `event_log.emit(...)` as a fire-and-forget (non-blocking on failure) from their own processes; only the Event Log Service writes to the database.
+-   The Event Log Service exposes a read API used by the DM Service to retrieve the last N events for a session (prompt context) and by admin tooling for campaign replay.
 
 ### Map Service
 
