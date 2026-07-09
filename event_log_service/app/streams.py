@@ -25,6 +25,10 @@ _client: aioredis.Redis | None = None
 # Add new downstream consumers here as services are built.
 _CONSUMER_GROUPS = ["memory-service"]
 
+# The unified stream that the Memory Service consumes.
+# All events are published here in addition to campaign-specific streams.
+_UNIFIED_STREAM = "events:all"
+
 # Tracks which stream keys have already had their consumer groups created
 # so we only call XGROUP CREATE once per campaign per process lifetime.
 _initialized_streams: set[str] = set()
@@ -61,16 +65,23 @@ async def _ensure_consumer_groups(client: aioredis.Redis, stream_key: str) -> No
 
 
 async def publish_event(campaign_id: str, event_data: dict[str, Any]) -> None:
-    """XADD the event to events:campaign:{campaign_id} stream.
+    """XADD the event to the campaign-specific stream and the unified stream.
 
-    Lazily creates consumer groups on the first publish per campaign stream
-    so that downstream consumers (e.g. Memory Service) can begin consuming
-    immediately without any separate setup step.
+    Campaign-specific stream (events:campaign:{id}): consumed by per-campaign
+    subscribers. Lazily creates consumer groups on first publish.
+
+    Unified stream (events:all): consumed by the Memory Service, which uses
+    a single consumer group across all campaigns.
     """
     client = await get_redis()
+    payload = json.dumps(event_data, default=str)
     stream_key = f"events:campaign:{campaign_id}"
-    await client.xadd(stream_key, {"data": json.dumps(event_data, default=str)})
-    logger.debug("Published %s to stream %s", event_data.get("event_type"), stream_key)
+
+    # Publish to campaign-specific stream
+    await client.xadd(stream_key, {"data": payload})
+    # Publish to unified stream consumed by the Memory Service
+    await client.xadd(_UNIFIED_STREAM, {"data": payload})
+    logger.debug("Published %s to %s + %s", event_data.get("event_type"), stream_key, _UNIFIED_STREAM)
 
     if stream_key not in _initialized_streams:
         await _ensure_consumer_groups(client, stream_key)
