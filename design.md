@@ -269,7 +269,143 @@ All routes accept an optional `event_context` field; when supplied, the Rules En
 
 ### Combat Engine
 
-Handles initiative, attacks, damage, conditions, and movement.
+Coordinates **authoritative encounter-time combat state** across initiative, attacks, movement, conditions, spell casting, and action economy. The service does not own a database; instead it reads and writes the active encounter row in the World State Service and calls the Rules Engine for deterministic resolution.
+
+**Authoritative combat model:**
+
+-   **Encounter-owned combatants** — The client does **not** submit authoritative AC, HP, conditions, spell slots, or death-save counts on each action. The Combat Engine reads the acting combatant and target directly from the active encounter snapshot.
+-   **Turn-gated actions** — Attack, move, death save, grapple, shove, spell cast, dash, disengage, dodge, help, hide, and ready all validate whose turn it is before mutating state. Opportunity attacks are the exception; they consume a reaction and may occur outside the acting creature’s turn.
+-   **Per-turn state** — Each combatant carries transient turn data: movement spent, extra movement from Dash, action / bonus action / reaction availability, attacks used within the current action, disengage / dodge flags, hidden state, help target, and readied trigger metadata.
+-   **Capability-driven economy** — The encounter snapshot stores lightweight combat capabilities (`attacks_per_action`, `can_dash_as_bonus_action`, `can_attack_as_bonus_action`, etc.) so the service can support mechanics such as Extra Attack and rogue-style bonus-action mobility without hard-coding class logic into every route.
+-   **Player sync** — When a player character’s HP, temp HP, conditions, concentration, spell slots, death saves, or position change in combat, the Combat Engine also patches the corresponding character row in the World State Service.
+
+**Encounter combatant snapshot** (stored inside `encounter_state.combatant_states` in World State):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `combatant_id`, `name`, `is_player` | scalar | Identity + player/NPC flag |
+| `current_hp`, `max_hp`, `temp_hp` | int | Temp HP is consumed before normal HP |
+| `armor_class`, `speed` | int | Used directly for combat resolution |
+| `ability_scores`, `proficiency_bonus` | object / int | Passed to Rules Engine |
+| `conditions` | `list[str]` | Includes combat conditions such as `prone`, `grappled`, `unconscious` |
+| `proficient_skills`, `proficient_saving_throws`, `expertise_skills` | `list[str]` | Used for grapple/shove/hide checks |
+| `exhaustion_level` | int 0–6 | Affects movement and ability checks |
+| `is_proficient_with_weapon` | bool | Caller asserts equipment proficiency |
+| `concentration` | `str?` | Active concentration spell name |
+| `spell_slots` | `dict[level_n -> int]` | Remaining slots used by `/combat/spell-cast` |
+| `death_saves` | `{successes, failures}` | Authoritative death-save counter |
+| `damage_resistances`, `damage_immunities`, `damage_vulnerabilities` | `list[str]` | Passed through to Rules Engine attacks |
+| `combat_capabilities` | object | `attacks_per_action`, bonus-action permissions, reaction/opportunity permissions |
+| `turn_state` | object | Movement spent, extra movement, action flags, hidden/disengage/dodge/help/ready state |
+| `position` | `{x, y, map_id}?` | Optional encounter-map coordinate |
+
+**`combat_capabilities`**:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `attacks_per_action` | `int >= 1` | `1` |
+| `can_attack_as_bonus_action` | `bool` | `false` |
+| `can_dash_as_bonus_action` | `bool` | `false` |
+| `can_disengage_as_bonus_action` | `bool` | `false` |
+| `can_dodge_as_bonus_action` | `bool` | `false` |
+| `can_help_as_bonus_action` | `bool` | `false` |
+| `can_hide_as_bonus_action` | `bool` | `false` |
+| `can_ready_as_bonus_action` | `bool` | `false` |
+| `can_opportunity_attack` | `bool` | `true` |
+
+**`turn_state`**:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `movement_spent` | `int` | Movement already spent this turn |
+| `extra_movement_budget` | `int` | Additional feet granted by Dash |
+| `action_available` / `bonus_action_available` / `reaction_available` | `bool` | Remaining action economy |
+| `attacks_used_this_action` | `int` | Used with `attacks_per_action` to support Extra Attack |
+| `disengage_active` | `bool` | Suppresses opportunity attacks against this creature until turn end |
+| `dodge_active` | `bool` | Stored for later consumers of attack disadvantage |
+| `hidden` | `bool` | Result of successful Hide action |
+| `help_target_id`, `help_type` | `UUID?`, `str?` | Tracks Help grant for later attack/check consumption |
+| `ready_trigger`, `ready_action` | `str?`, `str?` | Stores readied action metadata |
+
+**Key design decisions:**
+
+-   **Rules Engine stays stateless** — The Combat Engine transforms encounter combatants into Rules Engine request payloads; the Rules Engine never reads persistence directly.
+-   **Movement is cumulative across the turn** — `/combat/move` validates one move with the Rules Engine, then checks that `movement_spent + movement_cost <= speed + extra_movement_budget`.
+-   **Dash is additive, not a one-shot flag** — `/combat/dash` increases `extra_movement_budget` by the combatant’s speed; later move actions consume against the combined budget.
+-   **Extra Attack is action-scoped** — A weapon attack using `action_cost=action` increments `attacks_used_this_action`; the action is only consumed once that counter reaches `attacks_per_action`.
+-   **Concentration is resolved on damage** — Any damaging attack against a concentrating target triggers a concentration check; dropping to 0 HP breaks concentration immediately.
+-   **Disengage is stored as state** — Opportunity attacks reject against targets whose `turn_state.disengage_active=true`.
+-   **Monsters vs players at 0 HP** — Player characters gain `unconscious` plus reset death saves at 0 HP. Non-player combatants currently just hit 0 HP; kill/remove semantics remain a higher-layer DM policy.
+
+**Representative request models:**
+
+`POST /combat/start` body — `StartCombatRequest`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id`, `session_id`, `user_id` | `UUID` | Audit context |
+| `map_id` | `UUID?` | Optional encounter map |
+| `combatants` | `list[CombatantEntry]` | Minimum 1 |
+
+Each `CombatantEntry` includes the full initial combat snapshot: HP/temp HP, AC, speed, ability scores, proficiency metadata, concentration, spell slots, death saves, target defenses, capabilities, and optional `position`.
+
+`POST /combat/attack` body — `AttackActionRequest`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id`, `session_id`, `user_id` | `UUID` | |
+| `attacker_id`, `target_id` | `UUID` | IDs must exist in active encounter |
+| `weapon` | `WeaponDefinition` | Passed to Rules Engine |
+| `action_cost` | `action / bonus_action / reaction / none` | Default `action` |
+| `cover_bonus` | `0 / 2 / 5` | Cover applied to target AC |
+| `adjacent_to_hostile_creature` | `bool` | Ranged-in-melee disadvantage hook |
+| `extra_damage_dice` | `list[str]` | Sneak Attack, Divine Smite-style extras |
+| `expected_updated_at` | `datetime` | Optimistic lock on encounter row |
+
+`POST /combat/spell-cast` body — `SpellCastActionRequest`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `caster_id` | `UUID` | Must be current turn combatant |
+| `spell_name` | `str` | |
+| `spell_level` | `0–9` | |
+| `action_cost` | `action / bonus_action / reaction / none` | |
+| `is_concentration` | `bool` | Sets `concentration` on success |
+| `requires_verbal`, `requires_somatic` | `bool` | Passed through to Rules Engine |
+| `expected_updated_at` | `datetime` | |
+
+**API routes:**
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/combat` | Returns full active encounter snapshot |
+| `POST` | `/combat/start` | Rolls initiative, creates encounter, seeds authoritative combatant state |
+| `DELETE` | `/combat/end` | Ends active encounter |
+| `POST` | `/combat/next-turn` | Advances initiative index; resets the new active combatant’s turn state |
+| `POST` | `/combat/attack` | Weapon attack; supports Extra Attack, temp HP, concentration damage handling |
+| `POST` | `/combat/move` | Validates movement, tracks cumulative movement spent, clears `prone` when standing |
+| `POST` | `/combat/dash` | Adds extra movement budget for the turn |
+| `POST` | `/combat/disengage` | Marks `disengage_active` until turn end |
+| `POST` | `/combat/dodge` | Marks `dodge_active` until turn end |
+| `POST` | `/combat/help` | Stores Help target + help type |
+| `POST` | `/combat/hide` | Runs Stealth ability check through Rules Engine; stores `hidden` |
+| `POST` | `/combat/ready` | Stores ready trigger + description |
+| `POST` | `/combat/opportunity-attack` | Consumes attacker reaction; blocked by target disengage |
+| `POST` | `/combat/death-save` | Uses authoritative death-save counters from encounter state |
+| `POST` | `/combat/grapple` | Contest via Rules Engine; applies `grappled` on success |
+| `POST` | `/combat/shove` | Contest via Rules Engine; applies `prone` or updates pushed position |
+| `POST` | `/combat/spell-cast` | Validates slots / concentration and mutates spell-slot + concentration state |
+
+**Events emitted:**
+
+-   `combat.state_changed` — encounter start/end, turn advance, movement, dash/disengage/dodge/help/hide/ready, death saves, grapple/shove, and any combat-state mutation not already represented by a more specific Rules Engine event.
+-   `attack.resolved` — enriched attack result including post-damage HP/temp HP and concentration-loss summary.
+
+**Current boundaries:**
+
+-   `hidden`, `dodge_active`, `help_target_id`, and `ready_*` are persisted so later services can consume them, but the Combat Engine does not yet automatically apply all of those modifiers during downstream attacks.
+-   Opportunity attacks are implemented as an explicit route rather than an automatic trigger system.
+-   No integration tests are defined yet; route tests mock World State and Rules Engine clients.
 
 ### Story State Manager
 
