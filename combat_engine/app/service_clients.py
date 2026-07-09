@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _RE_TIMEOUT = 5.0    # Rules Engine — synchronous computation, should be fast
 _WS_TIMEOUT = 5.0    # World State — simple DB reads/writes
+_MAP_TIMEOUT = 5.0   # Map Service — simple DB reads/writes
 
 
 # ── Rules Engine ─────────────────────────────────────────────────────────────
@@ -337,3 +338,54 @@ async def patch_character(
     except Exception as exc:
         logger.error("World State PATCH /characters unreachable: %s", exc)
         raise HTTPException(502, "World State unavailable") from exc
+
+
+# ── Map Service — best effort token sync ─────────────────────────────────────
+
+async def upsert_map_token_best_effort(map_id: UUID, payload: dict[str, Any]) -> None:
+    """Best-effort token sync to the Map Service; logs and returns on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=_MAP_TIMEOUT) as client:
+            resp = await client.put(
+                f"{settings.map_service_url}/maps/{map_id}/tokens",
+                json=payload,
+            )
+            resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("Map Service token upsert failed for map %s: %s", map_id, exc)
+
+
+async def list_map_tokens_best_effort(
+    map_id: UUID,
+    campaign_id: UUID,
+    encounter_id: UUID | None,
+) -> list[dict[str, Any]]:
+    """Best-effort token listing. Returns [] on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=_MAP_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.map_service_url}/maps/{map_id}/tokens",
+                params={
+                    "campaign_id": str(campaign_id),
+                    **({"encounter_id": str(encounter_id)} if encounter_id else {}),
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning("Map Service token list failed for map %s: %s", map_id, exc)
+        return []
+
+
+async def delete_map_token_best_effort(map_id: UUID, token_id: UUID, campaign_id: UUID) -> None:
+    """Best-effort token deletion. Logs and returns on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=_MAP_TIMEOUT) as client:
+            resp = await client.delete(
+                f"{settings.map_service_url}/maps/{map_id}/tokens/{token_id}",
+                params={"campaign_id": str(campaign_id)},
+            )
+            if resp.status_code not in (204, 404):
+                resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("Map Service token delete failed for map %s token %s: %s", map_id, token_id, exc)

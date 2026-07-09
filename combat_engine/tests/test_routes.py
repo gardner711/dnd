@@ -432,6 +432,33 @@ def test_spell_cast_consumes_slot_and_sets_concentration(client, monkeypatch, en
     assert patch_character.await_args.args[2]["concentration"] == "Bless"
 
 
+def test_move_syncs_map_token_best_effort_when_position_changes(client, monkeypatch, encounter_dict, character_dict):
+    encounter = deepcopy(encounter_dict)
+    encounter["map_id"] = str(uuid4())
+    monkeypatch.setattr(clients, "get_encounter", AsyncMock(return_value=encounter))
+    monkeypatch.setattr(clients, "validate_movement", AsyncMock(return_value={"valid": True, "effective_speed": 30, "distance_requested": 10, "movement_cost": 10, "rejection_reason": None}))
+    monkeypatch.setattr(clients, "update_encounter", AsyncMock(return_value=encounter))
+    monkeypatch.setattr(clients, "get_character", AsyncMock(return_value=character_dict))
+    monkeypatch.setattr(clients, "patch_character", AsyncMock(return_value=character_dict))
+    upsert_token = AsyncMock(return_value=None)
+    monkeypatch.setattr(clients, "upsert_map_token_best_effort", upsert_token)
+
+    response = client.post(
+        "/combat/move",
+        json={
+            "campaign_id": str(_CAMP),
+            "session_id": str(_SESSION),
+            "user_id": str(_USER),
+            "combatant_id": str(_P1),
+            "distance_feet": 10,
+            "new_position": {"x": 4, "y": 6, "map_id": encounter["map_id"]},
+        },
+    )
+
+    assert response.status_code == 200
+    upsert_token.assert_awaited_once()
+
+
 def test_end_combat_deletes_active_encounter(client, monkeypatch, encounter_dict):
     monkeypatch.setattr(clients, "get_encounter", AsyncMock(return_value=encounter_dict))
     delete_encounter = AsyncMock(return_value=True)

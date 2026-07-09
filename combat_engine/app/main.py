@@ -121,6 +121,24 @@ async def start_combat(body: StartCombatRequest) -> StartCombatResponse:
         },
     )
 
+    if body.map_id:
+        for combatant in body.combatants:
+            if combatant.position is None:
+                continue
+            await service_clients.upsert_map_token_best_effort(
+                body.map_id,
+                {
+                    "campaign_id": str(body.campaign_id),
+                    "encounter_id": str(encounter["encounter_id"]),
+                    "aggregate_id": str(combatant.combatant_id),
+                    "aggregate_type": "character" if combatant.is_player else "npc",
+                    "x": combatant.position["x"],
+                    "y": combatant.position["y"],
+                    "visible": True,
+                    "meta": {"session_id": str(body.session_id), "user_id": str(body.user_id)},
+                },
+            )
+
     await event_log.emit(
         event_type="combat.state_changed",
         aggregate_id=str(encounter["encounter_id"]),
@@ -153,6 +171,12 @@ async def end_combat(
     deleted = await service_clients.delete_encounter(campaign_id)
     if not deleted:
         raise HTTPException(404, "No active encounter for this campaign")
+
+    if encounter.get("map_id"):
+        tokens = await service_clients.list_map_tokens_best_effort(UUID(encounter["map_id"]), campaign_id, UUID(encounter["encounter_id"]))
+        for token in tokens:
+            await service_clients.delete_map_token_best_effort(UUID(encounter["map_id"]), UUID(token["token_id"]), campaign_id)
+
     await event_log.emit(
         event_type="combat.state_changed",
         aggregate_id=str(encounter["encounter_id"]),
@@ -440,6 +464,23 @@ async def move(body: MoveActionRequest) -> MoveActionResponse:
         if body.new_position is not None:
             sync_payload["position"] = body.new_position
         await _sync_player_character(body.combatant_id, body.campaign_id, body.session_id, body.user_id, sync_payload)
+
+    if body.new_position is not None:
+        map_id = body.new_position.get("map_id") or encounter.get("map_id")
+        if map_id:
+            await service_clients.upsert_map_token_best_effort(
+                UUID(str(map_id)),
+                {
+                    "campaign_id": str(body.campaign_id),
+                    "encounter_id": str(encounter["encounter_id"]),
+                    "aggregate_id": str(body.combatant_id),
+                    "aggregate_type": "character" if state.get("is_player") else "npc",
+                    "x": body.new_position["x"],
+                    "y": body.new_position["y"],
+                    "visible": True,
+                    "meta": {"session_id": str(body.session_id), "user_id": str(body.user_id)},
+                },
+            )
 
     await event_log.emit(
         event_type="combat.state_changed",
@@ -792,6 +833,22 @@ async def shove(body: ShoveActionRequest) -> ShoveActionResponse:
         if target_position is not None:
             sync_payload["position"] = target_position
         await _sync_player_character(body.target_id, body.campaign_id, body.session_id, body.user_id, sync_payload)
+    if result["shove_succeeds"] and body.shove_type == "push_away" and target_position is not None:
+        map_id = target_position.get("map_id") or encounter.get("map_id")
+        if map_id:
+            await service_clients.upsert_map_token_best_effort(
+                UUID(str(map_id)),
+                {
+                    "campaign_id": str(body.campaign_id),
+                    "encounter_id": str(encounter["encounter_id"]),
+                    "aggregate_id": str(body.target_id),
+                    "aggregate_type": "character" if target.get("is_player") else "npc",
+                    "x": target_position["x"],
+                    "y": target_position["y"],
+                    "visible": True,
+                    "meta": {"session_id": str(body.session_id), "user_id": str(body.user_id)},
+                },
+            )
     return ShoveActionResponse(shove_succeeds=result["shove_succeeds"], shove_type=result["shove_type"], target_conditions=target_conditions, target_position=target_position)
 
 

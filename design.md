@@ -970,24 +970,38 @@ CREATE TABLE events (
 
 ### Map Service
 
-Manages map data, player-visible state (fog-of-war), and encounter
-token placement. Geometric computation (line of sight, area-of-effect)
-is intentionally **deferred to the client** to avoid over-engineering
-the server and to leverage GPU-accelerated rendering on the device.
+Manages map definitions, player-visible fog-of-war, active-map
+selection, and encounter token placement. Geometric computation (line
+of sight, area-of-effect) is intentionally **deferred to the client**
+to avoid over-engineering the server and to leverage GPU-accelerated
+rendering on the device.
 
 **Scope — server responsibilities:**
 
 -   Store map definitions: tile layers, walls, doors, and light sources
     as structured data (GeoJSON-style feature collections) in
-    PostgreSQL; large tile/image assets in MinIO.
+    PostgreSQL; large tile/image assets remain external via object keys.
 -   Maintain **fog-of-war state** per `(campaign_id, character_id)` as
-    a bitmask or explored-cell set — what each character has seen,
+    an explored-cell set — what each character has seen,
     persisted across sessions.
 -   Store **encounter token positions** — authoritative `(x, y)` for
-    every combatant, updated by the Combat Engine on each move action.
--   Expose a **map snapshot API** that returns the current map
-    definition, token positions, and the requesting character's
-    fog-of-war state in a single response.
+    every combatant, updated by the Combat Engine on encounter start,
+    move, shove reposition, and encounter teardown.
+-   Maintain **active map selection** at two scopes:
+    -   campaign default active map
+    -   optional character-specific active map override
+-   Expose **snapshot APIs** that return the map definition, ordered
+    layers, token positions, and the requesting character's fog-of-war
+    state in a single response.
+
+**Scope — isolation and reuse:**
+
+-   All mutable map state is campaign-scoped. A map, fog state, token,
+    or active-map selection in one campaign never overlaps with another.
+-   The service supports both **large campaign maps** and **small
+    dungeon/tactical maps** through a first-class `kind` field rather
+    than separate subsystems.
+-   Current kinds: `world`, `region`, `city`, `dungeon`, `battlemap`.
 
 **Scope — client responsibilities (Flutter):**
 
@@ -1006,16 +1020,161 @@ the server and to leverage GPU-accelerated rendering on the device.
 -   Server-side LoS validation for cheat prevention (anti-cheat is
     not a priority for a self-hosted, trusted-player platform).
 -   Dynamic lighting and shadow rendering beyond basic fog-of-war.
+-   Immutable map templates shared across campaigns; current maps are
+    campaign-owned runtime records.
 
-**Map data model:**
+**Database schema:**
 
-  Entity            Fields
-  ----------------- -------------------------------------------------------
-  `map`             `map_id`, `campaign_id`, name, width, height, tile_size
-  `map_layer`       `layer_id`, `map_id`, type (`terrain`/`object`/`roof`), GeoJSON features
-  `fog_of_war`      `map_id`, `character_id`, explored cell bitmask
-  `encounter`       `encounter_id`, `map_id`, `campaign_id`, active bool
-  `token`           `token_id`, `encounter_id`, `aggregate_id`, `aggregate_type`, x, y, visible
+```sql
+CREATE TABLE maps (
+    map_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id          UUID NOT NULL,
+    name                 TEXT NOT NULL,
+    kind                 TEXT NOT NULL,      -- world|region|city|dungeon|battlemap
+    width                INT NOT NULL,
+    height               INT NOT NULL,
+    tile_size            INT NOT NULL DEFAULT 5,
+    description          TEXT NOT NULL DEFAULT '',
+    background_asset_key TEXT,
+    active               BOOL NOT NULL DEFAULT TRUE,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Index: (campaign_id, active, updated_at DESC)
+
+CREATE TABLE map_layers (
+    layer_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    map_id       UUID NOT NULL REFERENCES maps ON DELETE CASCADE,
+    campaign_id  UUID NOT NULL,
+    type         TEXT NOT NULL,     -- terrain|object|roof|wall|door|light|marker
+    name         TEXT NOT NULL,
+    z_index      INT NOT NULL DEFAULT 0,
+    visible      BOOL NOT NULL DEFAULT TRUE,
+    features     JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Index: (campaign_id, map_id, z_index, created_at)
+
+CREATE TABLE fog_of_war (
+    map_id         UUID NOT NULL REFERENCES maps ON DELETE CASCADE,
+    campaign_id    UUID NOT NULL,
+    character_id   UUID NOT NULL,
+    explored_cells JSONB NOT NULL DEFAULT '[]',
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (map_id, campaign_id, character_id)
+);
+
+CREATE TABLE map_tokens (
+    token_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    map_id          UUID NOT NULL REFERENCES maps ON DELETE CASCADE,
+    campaign_id     UUID NOT NULL,
+    encounter_id    UUID,
+    aggregate_id    UUID NOT NULL,
+    aggregate_type  TEXT NOT NULL,  -- character|npc|combat
+    x               INT NOT NULL,
+    y               INT NOT NULL,
+    visible         BOOL NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (map_id, campaign_id, aggregate_id)
+);
+-- Index: (campaign_id, map_id, encounter_id, updated_at DESC)
+
+CREATE TABLE campaign_active_map (
+    campaign_id UUID PRIMARY KEY,
+    map_id      UUID NOT NULL REFERENCES maps ON DELETE CASCADE,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE character_active_map (
+    campaign_id  UUID NOT NULL,
+    character_id UUID NOT NULL,
+    map_id       UUID NOT NULL REFERENCES maps ON DELETE CASCADE,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (campaign_id, character_id)
+);
+```
+
+**Key design decisions:**
+
+-   **Campaign-owned mutable maps** — all runtime maps are campaign-scoped records; no live map state is shared across campaigns.
+-   **Two-scope selection model** — `GET /maps/active` resolves a character override first, then falls back to the campaign default map.
+-   **Snapshot over composition** — the client should prefer one snapshot call over separately fetching map, layers, fog, and tokens.
+-   **Token sync is derived from Combat Engine** — encounter token state is best-effort synchronized from combat movement and positioning; encounter state remains the primary combat authority.
+-   **Fog defaults empty** — if no fog row exists for `(map_id, character_id)`, reads return an empty explored set rather than 404.
+
+**Representative request models:**
+
+`POST /maps` body — `MapCreate`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `UUID` | required |
+| `name` | `str` | required |
+| `kind` | `MapKind` | default `dungeon` |
+| `width`, `height` | `int` | required |
+| `tile_size` | `int` | default `5` |
+| `description` | `str` | default `''` |
+| `background_asset_key` | `str?` | optional external asset key |
+| `meta` | `EventMeta?` | optional audit context |
+
+`PUT /maps/active` body — `MapSelectionUpsert`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `UUID` | required |
+| `map_id` | `UUID` | required |
+| `character_id` | `UUID?` | omitted = campaign default; set = character override |
+| `meta` | `EventMeta?` | optional audit context |
+
+`PUT /maps/{id}/tokens` body — `TokenUpsert`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `campaign_id` | `UUID` | required |
+| `encounter_id` | `UUID?` | optional encounter grouping |
+| `aggregate_id` | `UUID` | combatant or aggregate represented by this token |
+| `aggregate_type` | `character / npc / combat` | |
+| `x`, `y` | `int` | map coordinates |
+| `visible` | `bool` | default `true` |
+| `meta` | `EventMeta?` | optional audit context |
+
+**API routes:**
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/maps` | Create a campaign-owned map |
+| `GET` | `/maps` | List campaign maps; `active_only=true` by default |
+| `GET` | `/maps/{id}` | Fetch one map |
+| `PATCH` | `/maps/{id}` | Update metadata, dimensions, active flag |
+| `DELETE` | `/maps/{id}` | Hard delete; cascades layers/fog/tokens |
+| `PUT` | `/maps/active` | Set campaign default or character-specific active map |
+| `GET` | `/maps/active` | Resolve selected active map for campaign/character scope |
+| `POST` | `/maps/{id}/layers` | Create one layer |
+| `GET` | `/maps/{id}/layers` | List ordered layers |
+| `PATCH` | `/maps/{id}/layers/{layer_id}` | Update one layer |
+| `DELETE` | `/maps/{id}/layers/{layer_id}` | Delete one layer |
+| `PUT` | `/maps/{id}/fog` | Full fog replace for one character |
+| `PATCH` | `/maps/{id}/fog` | Merge-add explored cells |
+| `GET` | `/maps/{id}/fog` | Read fog for one character; returns empty set if absent |
+| `PUT` | `/maps/{id}/tokens` | Upsert token by `(map_id, campaign_id, aggregate_id)` |
+| `GET` | `/maps/{id}/tokens` | List tokens; optional `encounter_id` filter |
+| `PATCH` | `/maps/{id}/tokens/{token_id}` | Update token coordinates/visibility |
+| `DELETE` | `/maps/{id}/tokens/{token_id}` | Delete one token |
+| `GET` | `/maps/{id}/snapshot` | Return map + layers + fog + tokens |
+| `GET` | `/maps/active/snapshot` | Resolve active map first, then return snapshot |
+| `GET` | `/health` | DB connectivity probe |
+
+**Events emitted:**
+
+-   `map.created`
+-   `map.updated`
+-   `map.active_selected`
+-   `map.layer_created`
+-   `map.layer_updated`
+-   `map.fog_updated`
+-   `map.token_updated`
 
 ## Sequence: Event Audit (Combat Example)
 
